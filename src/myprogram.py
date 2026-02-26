@@ -186,44 +186,72 @@ class MyModel:
             return self.id2char[idx]
         return " "
 
-    def run_pred(self, data):
-        preds = []
+    def run_pred(self, data, batch_size=32):
         self.model.eval()
         self.model.to(self.device)
 
-        for inp in data:
+        # Pre-process: encode all inputs, track which are valid
+        encoded_inputs = []
+        valid_indices = []
+        fallback_indices = []
+
+        for i, inp in enumerate(data):
+            if not inp or not inp.strip():
+                fallback_indices.append(i)
+                continue
+            encoded = self._encode_text(inp)[-MAX_SEQ_LEN:]
+            if not encoded:
+                fallback_indices.append(i)
+                continue
+            encoded_inputs.append(encoded)
+            valid_indices.append(i)
+
+        # Initialize results with fallback
+        preds = ['eta'] * len(data)
+
+        # Batched inference
+        for batch_start in range(0, len(encoded_inputs), batch_size):
+            batch_end = min(batch_start + batch_size, len(encoded_inputs))
+            batch_encoded = encoded_inputs[batch_start:batch_end]
+            batch_indices = valid_indices[batch_start:batch_end]
+
+            # Pad sequences in batch
+            max_len = max(len(seq) for seq in batch_encoded)
+            padded_ids = []
+            attention_masks = []
+            for seq in batch_encoded:
+                pad_len = max_len - len(seq)
+                padded_ids.append(seq + [PAD_TOKEN_ID] * pad_len)
+                attention_masks.append([1] * len(seq) + [0] * pad_len)
+
+            input_ids = torch.tensor(padded_ids, dtype=torch.long).to(self.device)
+            attention_mask = torch.tensor(attention_masks, dtype=torch.long).to(self.device)
+
             try:
-                # Skip empty or whitespace-only inputs
-                if not inp or not inp.strip():
-                    preds.append('eta')
-                    continue
-
-                # Encode input text to character-level tokens
-                encoded = self._encode_text(inp)[-MAX_SEQ_LEN:]
-                if not encoded:
-                    preds.append('eta')
-                    continue
-
-                input_ids = torch.tensor([encoded], dtype=torch.long).to(self.device)
-
                 with torch.no_grad():
-                    logits = self.model(input_ids).logits[:, -1, :]  # Last position
-                    probs = torch.softmax(logits, dim=-1)
+                    outputs = self.model(input_ids, attention_mask=attention_mask)
+                    # Get logits at last non-padded position for each sequence
+                    # We use the position before padding starts
+                    seq_lengths = attention_mask.sum(dim=1) - 1  # last valid index
+                    batch_logits = outputs.logits[torch.arange(len(batch_encoded)), seq_lengths, :]
+                    probs = torch.softmax(batch_logits, dim=-1)
 
-                # Get top 3 predictions
-                top_k_probs, top_k_ids = torch.topk(probs, 3)
-                top_guesses = []
-                for i in range(3):
-                    tok_id = top_k_ids[0][i].item()
-                    char = self._decode_id(tok_id)
-                    # Replace special tokens, newlines, and carriage returns with space
-                    if tok_id < OFFSET or char in ('\n', '\r'):
-                        char = " "
-                    top_guesses.append(char)
+                # Get top 3 for each in batch
+                top_k_probs, top_k_ids = torch.topk(probs, 3, dim=-1)
 
-                preds.append(''.join(top_guesses))
-            except:
-                preds.append('eta')
+                for j, idx in enumerate(batch_indices):
+                    top_guesses = []
+                    for k in range(3):
+                        tok_id = top_k_ids[j][k].item()
+                        char = self._decode_id(tok_id)
+                        if tok_id < OFFSET or char in ('\n', '\r'):
+                            char = " "
+                        top_guesses.append(char)
+                    preds[idx] = ''.join(top_guesses)
+            except Exception:
+                # Fallback for entire batch on error
+                for idx in batch_indices:
+                    preds[idx] = 'eta'
 
         return preds
 
@@ -249,6 +277,7 @@ class MyModel:
         # Load the trained model
         model_path = os.path.join(work_dir, 'nano-char-gpt-c4-v2')
         device = "cuda" if torch.cuda.is_available() else "cpu"
+        print("Device: " + device)
         model = GPT2LMHeadModel.from_pretrained(model_path).to(device)
         return MyModel(model=model, char2id=char2id, id2char=id2char)
 
